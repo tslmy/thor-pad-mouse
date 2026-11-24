@@ -1,0 +1,6 @@
+__pycache__/
+*.pyc
+.DS_Store
+*.log
+# Screenshots from shell tests can show proprietary Windows artwork.
+*.png

@@ -1,0 +1,284 @@
+#!/usr/bin/env python3
+"""Use a handheld's controls as a mouse in desktop sessions.
+
+InputPlumber does the actual translation. This only decides when: it layers the
+mappings in mappings.yaml onto the active InputPlumber profile while a desktop
+compositor runs, and puts the previous profile back for Gaming Mode.
+"""
+import argparse
+import contextlib
+import copy
+import fcntl
+import json
+import os
+from pathlib import Path
+import shutil
+import signal
+import subprocess
+import sys
+import time
+
+SERVICE = 'org.shadowblip.InputPlumber'
+ROOT = '/org/shadowblip/InputPlumber'
+IFACE = 'org.shadowblip.Input.CompositeDevice'
+PROFILE_NAME = 'pad-mouse'
+STOCK_PROFILE = '/usr/share/inputplumber/profiles/default.yaml'
+# Plasma uses kwin_wayland; the win4wine ReactOS, XP and Win7 shells use labwc.
+COMPOSITORS = frozenset(os.environ.get('PAD_MOUSE_COMPOSITORS', 'kwin_wayland labwc').split())
+NEEDED = {'Gamepad:Axis:RightStick', 'Gamepad:Button:RightBumper', 'Gamepad:Trigger:RightTrigger'}
+POLL_SECONDS = 2.0     # how fast a session change is noticed
+RECHECK_SECONDS = 10.0  # how fast a reset profile is noticed
+
+
+def xdg(variable, fallback):
+    return Path(os.environ.get(variable) or fallback)
+
+
+def runtime_dir():
+    path = xdg('XDG_RUNTIME_DIR', f'/run/user/{os.getuid()}') / PROFILE_NAME
+    path.mkdir(mode=0o700, exist_ok=True)
+    return path
+
+
+def mappings_path():
+    return xdg('XDG_CONFIG_HOME', Path.home() / '.config') / PROFILE_NAME / 'mappings.yaml'
+
+
+# --- pure logic -------------------------------------------------------------
+
+def source_key(mapping):
+    """Which physical control a mapping consumes, or None if not a gamepad one."""
+    gamepad = (mapping.get('source_event') or {}).get('gamepad') or {}
+    if 'button' in gamepad:
+        return 'button', gamepad['button']
+    for kind in ('axis', 'trigger', 'dial', 'gyro'):
+        if kind in gamepad:
+            return kind, gamepad[kind].get('name')
+    return None
+
+
+def merge(base, extra):
+    """Return base with our mappings replacing anything on the same controls."""
+    taken = {source_key(mapping) for mapping in extra} - {None}
+    merged = copy.deepcopy(base)
+    merged['name'] = PROFILE_NAME
+    merged['mapping'] = [m for m in base.get('mapping') or [] if source_key(m) not in taken]
+    merged['mapping'] += copy.deepcopy(extra)
+    # A profile that pins its output devices must still include a mouse.
+    targets = merged.get('target_devices')
+    if targets and 'mouse' not in targets:
+        targets.append('mouse')
+    return merged
+
+
+def gaming(processes):
+    """Gaming Mode (gamescope-session-plus), or gamescope started by a game."""
+    return any(name.startswith('gamescope') for name in processes)
+
+
+def should_emulate(processes, switched_off):
+    """Desktop compositor running, not Gaming Mode, and not switched off."""
+    # Gaming Mode wins: Armada also runs a Plasma panel on the lower screen then.
+    return not switched_off and not gaming(processes) and bool(COMPOSITORS & set(processes))
+
+
+# --- system -----------------------------------------------------------------
+
+def dbus(path, interface, method, parameters=None):
+    from gi.repository import Gio  # present on Armada; imported late for the tests
+    bus = Gio.bus_get_sync(Gio.BusType.SYSTEM)
+    return bus.call_sync(SERVICE, path, interface, method, parameters, None,
+                         Gio.DBusCallFlags.NONE, 10000, None).unpack()
+
+
+def call(path, method, *strings):
+    """Call a CompositeDevice method; all the ones we need take strings."""
+    from gi.repository import GLib
+    parameters = GLib.Variant(f'({"s" * len(strings)})', strings) if strings else None
+    return dbus(path, IFACE, method, parameters)
+
+
+def profile_name(path):
+    from gi.repository import GLib
+    return dbus(path, 'org.freedesktop.DBus.Properties', 'Get',
+                GLib.Variant('(ss)', (IFACE, 'ProfileName')))[0]
+
+
+def composite_devices():
+    """Every controller InputPlumber manages, with its properties, in one call."""
+    objects = dbus(ROOT, 'org.freedesktop.DBus.ObjectManager', 'GetManagedObjects')[0]
+    return {path: found[IFACE] for path, found in objects.items() if IFACE in found}
+
+
+def choose_device(devices, model, override=None):
+    """The handheld's own controller, not a controller plugged in later."""
+    paths = sorted(devices, key=lambda p: (len(p), p))
+    for path in paths:
+        if devices[path]['Name'] == (override or model):
+            return path
+    if override:
+        return None
+    # InputPlumber names some handhelds differently from their device tree.
+    return next((p for p in paths if NEEDED <= set(devices[p]['Capabilities'])), None)
+
+
+def find_device():
+    model = None
+    with contextlib.suppress(OSError):
+        model = Path('/sys/firmware/devicetree/base/model').read_text().strip('\0\n ')
+    devices = composite_devices()
+    path = choose_device(devices, model, os.environ.get('PAD_MOUSE_DEVICE'))
+    return path, devices.get(path)
+
+
+def own_processes():
+    names = []
+    for entry in os.scandir('/proc'):
+        if entry.name.isdigit():
+            with contextlib.suppress(OSError):
+                if entry.stat().st_uid == os.getuid():
+                    with open(f'/proc/{entry.name}/comm', 'rb') as comm:
+                        names.append(comm.read().decode(errors='replace').strip())
+    return names
+
+
+def switched_off():
+    return (runtime_dir() / 'off').exists()
+
+
+@contextlib.contextmanager
+def locked():
+    """Keep the service and a command-line toggle from interleaving."""
+    with open(runtime_dir() / 'lock', 'w') as handle:
+        fcntl.flock(handle, fcntl.LOCK_EX)
+        yield
+
+
+def apply(path, device):
+    if device['ProfileName'] == PROFILE_NAME:
+        return
+    import yaml  # present on Armada; imported late so the tests need no packages
+    extra = yaml.safe_load(mappings_path().read_text())['mapping']
+    current = call(path, 'GetProfileYaml')[0]
+    saved = runtime_dir() / 'previous.json'
+    saved.write_text(json.dumps({'path': device['ProfilePath'], 'yaml': current}))
+    merged = merge(yaml.safe_load(current), extra)
+    call(path, 'LoadProfileFromYaml', yaml.safe_dump(merged, sort_keys=False))
+
+
+def restore(path, device):
+    if device['ProfileName'] != PROFILE_NAME:
+        return
+    try:
+        saved = json.loads((runtime_dir() / 'previous.json').read_text())
+    except (OSError, ValueError):
+        saved = {}
+    if saved.get('path') and Path(saved['path']).is_file():
+        call(path, 'LoadProfilePath', saved['path'])
+    elif saved.get('yaml'):
+        call(path, 'LoadProfileFromYaml', saved['yaml'])
+    else:
+        call(path, 'LoadProfilePath', STOCK_PROFILE)
+
+
+def wanted():
+    return should_emulate(own_processes(), switched_off())
+
+
+def reconcile():
+    """Make the controller match the session. Returns (state, device path)."""
+    with locked():
+        path, device = find_device()
+        if path is None:
+            return 'no controller', None
+        if wanted():
+            apply(path, device)
+            return 'mouse', path
+        restore(path, device)
+        return 'gamepad', path
+
+
+# --- commands ---------------------------------------------------------------
+
+def run():
+    """The service loop. InputPlumber restarts reset profiles, so keep checking."""
+    stop = []
+    signal.signal(signal.SIGTERM, lambda *_: stop.append(True))
+    last = state = target = path = None
+    due = 0.0
+    while not stop:
+        try:
+            # Notice session changes quickly. Listing InputPlumber's devices is
+            # comparatively costly, so otherwise just watch the one profile name.
+            now_wanted = wanted()
+            recheck = time.monotonic() >= due
+            if now_wanted != target or (recheck and (
+                    path is None or (profile_name(path) == PROFILE_NAME) != now_wanted)):
+                state, path = reconcile()
+                target = now_wanted
+            if recheck:
+                due = time.monotonic() + RECHECK_SECONDS
+        except Exception as error:  # InputPlumber restarting, bad YAML edit, ...
+            state, target, path = f'error: {error}', None, None
+        if state != last:
+            print(state, flush=True)
+            last = state
+        time.sleep(POLL_SECONDS)
+
+
+def notify(message):
+    if shutil.which('notify-send'):
+        with contextlib.suppress(OSError, subprocess.SubprocessError):
+            subprocess.run(['notify-send', '--app-name=pad-mouse', '--expire-time=3000', message],
+                           capture_output=True, timeout=3)
+
+
+def switch(off):
+    flag = runtime_dir() / 'off'
+    with locked():
+        if off:
+            flag.touch()
+        else:
+            flag.unlink(missing_ok=True)
+    state, _ = reconcile()
+    message = {'mouse': 'Controller works as a mouse',
+               'gamepad': 'Controller works as a gamepad'}.get(state, state)
+    print(message)
+    notify(message)
+
+
+def status():
+    path, device = find_device()
+    processes = own_processes()
+    print(f'controller:     {device["Name"] if device else "not found"}')
+    print(f'active profile: {device["ProfileName"] if device else "-"}')
+    print(f'desktop:        {", ".join(sorted(COMPOSITORS & set(processes))) or "none"}')
+    print(f'gaming mode:    {"yes" if gaming(processes) else "no"}')
+    print(f'switched off:   {"yes" if switched_off() else "no"}')
+    if device and not any('/mouse' in target for target in device['TargetDevices']):
+        print('warning: InputPlumber has no virtual mouse target, so nothing can move the cursor')
+
+
+def main(argv=None):
+    parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    parser.add_argument('command', choices=('status', 'on', 'off', 'toggle', 'run', 'restore'),
+                        help='on, off and toggle are not remembered across reboots')
+    command = parser.parse_args(argv).command
+    try:
+        if command == 'status':
+            status()
+        elif command == 'run':
+            run()
+        elif command == 'restore':
+            with locked():
+                path, device = find_device()
+                if path:
+                    restore(path, device)
+        else:
+            switch(off=command == 'off' or (command == 'toggle' and not switched_off()))
+    except Exception as error:
+        sys.exit(f'pad-mouse: {error}')
+
+
+if __name__ == '__main__':
+    main()

@@ -1,0 +1,33 @@
+# The mappings pad-mouse adds, in InputPlumber's device-profile format, on top of
+# whatever profile is active. Everything not listed here keeps working as before.
+# After editing: systemctl --user restart pad-mouse
+#
+# Format: https://github.com/ShadowBlip/InputPlumber (rootfs/usr/share/inputplumber/schema)
+mapping:
+  - name: Right stick moves the cursor
+    source_event:
+      gamepad:
+        axis:
+          name: RightStick
+    target_events:
+      - mouse:
+          motion:
+            speed_pps: 800  # mouse units per second at full deflection
+
+  - name: R1 is the left button
+    source_event:
+      gamepad:
+        button: RightBumper
+    target_events:
+      - mouse:
+          button: Left
+
+  - name: R2 is the right button
+    source_event:
+      gamepad:
+        trigger:
+          name: RightTrigger
+          deadzone: 0.25  # how far to pull (0-1) before it counts as a click
+    target_events:
+      - mouse:
+          button: Right

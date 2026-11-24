@@ -1,0 +1,12 @@
+[Unit]
+Description=Controller as mouse in desktop sessions (InputPlumber profile switcher)
+
+[Service]
+ExecStart=%h/.local/bin/pad-mouse run
+# Never leave the mouse mappings behind for the next session.
+ExecStopPost=-%h/.local/bin/pad-mouse restore
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=default.target

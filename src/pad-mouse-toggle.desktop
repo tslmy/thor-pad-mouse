@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Application
+Name=Toggle Controller Mouse
+Comment=Switch the built-in controller between mouse and gamepad
+Exec="@HOME@/.local/bin/pad-mouse" toggle
+Icon=input-gaming
+Terminal=false
+Categories=Utility;
